@@ -1,21 +1,19 @@
 {
-  "latex-workshop.latex.recipe.default": "latexmk (pdf)",
+  "latex-workshop.latex.recipe.default": "latexmk (pdfLaTeX)",
   "latex-workshop.latex.recipes": [
-    {
-      "name": "latexmk (pdf)",
-      "tools": ["latexmk"]
-    }
+    { "name": "latexmk (XeLaTeX)", "tools": ["latexmk-xe"] },
+    { "name": "latexmk (pdfLaTeX)", "tools": ["latexmk-pdf"] }
   ],
   "latex-workshop.latex.tools": [
     {
-      "name": "latexmk",
+      "name": "latexmk-xe",
       "command": "latexmk",
-      "args": [
-        "-pdf",
-        "-interaction=nonstopmode",
-        "-file-line-error",
-        "%DOC%"
-      ]
+      "args": ["-xelatex", "-interaction=nonstopmode", "-file-line-error", "-synctex=1", "%DOC%"]
+    },
+    {
+      "name": "latexmk-pdf",
+      "command": "latexmk",
+      "args": ["-pdf", "-interaction=nonstopmode", "-file-line-error", "-synctex=1", "%DOC%"]
     }
   ]
 }
