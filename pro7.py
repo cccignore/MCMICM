@@ -100,7 +100,7 @@ for T in t_axis:
         rem -= m_b
     # 15%非线性压力惩罚
     pressure = (T_MAX - T) / (T_MAX - T_MIN)
-    final_cost = raw_cost * (1 + 0.3 * (pressure ** 2))
+    final_cost = raw_cost * (1 + 0.5* (pressure ** 2))
     pareto_data.append({"Time_Years": T, "Total_Cost_TrillionUSD": final_cost / 1e12})
 
 # 记录具体采样点的分配详情 (100%速度, 80%速度, 50%速度, 仅电梯)
