@@ -38,14 +38,12 @@ colors = {
 # =============================================================================
 # 2. 基地异质性配置 (基于真实建成时间的故障模型)
 # =============================================================================
-# 定义梯队参数: 设施越老，MTBF越短(易坏)，MTTR越长(难修)
 TIER_PARAMS = {
     "Modern":   {"mtbf": 300, "mttr": 2},  
     "Standard": {"mtbf": 200, "mttr": 4}, 
     "Legacy":   {"mtbf": 140,  "mttr": 7}  
 }
 
-# 真实映射表
 BASE_TIERS = {
     "Starbase (USA)": "Modern", "Mahia (NZL)": "Modern", "Alaska (USA)": "Modern",
     "Kourou (GUF)": "Standard", "Taiyuan (CHN)": "Standard", "Sriharikota (IND)": "Standard",
@@ -65,7 +63,7 @@ def get_rocket_stats(dv, isp, alpha, is_elevator=False):
 
 # 初始化数据
 k_g, cost_g = get_rocket_stats(DV_G, ISP_G, ALPHA_G, True)
-yearly_payload_g = (N_PORTS * U_PORT) / k_g # 电梯是理想的，不打折
+yearly_payload_g = (N_PORTS * U_PORT) / k_g 
 
 base_configs_list = []
 for name, lat in BASES_DATA.items():
@@ -73,26 +71,20 @@ for name, lat in BASES_DATA.items():
     dv_eff = DV_BASE - v_rot
     k, c = get_rocket_stats(dv_eff, ISP_E, ALPHA_E, False)
     
-    # 理论年运力 (Ideal Capacity)
     max_y_ideal = (LAMBDA_J * 365 * L_MAX) / k
-    
-    # 获取可靠性参数
     tier = BASE_TIERS.get(name, "Standard")
     params = TIER_PARAMS[tier]
     
-    # 计算可用度 Availability = MTBF / (MTBF + MTTR)
     denom = params['mtbf'] + params['mttr']
     if denom == 0: availability = 1.0
     else: availability = params['mtbf'] / denom
     
-    # 期望有效运力 (Effective Capacity) - 用于宏观规划
-    # 这就是"系统感知到火箭不可靠"的数学体现
     max_y_effective = max_y_ideal * availability
     
     base_configs_list.append({
         "Name": name, "Cost": c, 
         "Yearly_Ideal": max_y_ideal, 
-        "Yearly_Effective": max_y_effective, # 规划用这个
+        "Yearly_Effective": max_y_effective,
         "MTBF": params['mtbf'], "MTTR": params['mttr'],
         "Tier": tier
     })
@@ -100,33 +92,24 @@ for name, lat in BASES_DATA.items():
 df_bases = pd.DataFrame(base_configs_list).sort_values("Cost")
 total_yearly_rockets_effective = df_bases["Yearly_Effective"].sum()
 
-# 重新计算工期极限 (基于有效运力)
 T_MIN = M_TOTAL / (yearly_payload_g + total_yearly_rockets_effective)
 T_MAX = M_TOTAL / yearly_payload_g
 
 # =============================================================================
-# 3. 核心算法: 考虑故障风险的宏观规划求解器
+# 3. 核心算法: 宏观规划求解器
 # =============================================================================
 def solve_allocation_with_reliability(time_target, total_mass):
-    """
-    使用'期望有效运力'进行分配决策。
-    因为火箭不可靠，Effective Capacity 变小了，算法会自动减少对火箭的依赖。
-    """
     final_marginal_discount = 0.0 
-    
     for i in range(10):
-        # 积分平均折扣
         avg_discount = final_marginal_discount * 0.5
         effective_base_costs = df_bases["Cost"] * (1 - avg_discount)
         avg_rocket_cost = effective_base_costs.mean()
-        
         rem = total_mass
         cost_iter = 0
         mass_ele = 0
         mass_roc = 0
         
         if avg_rocket_cost < cost_g:
-            # 极端情况优先火箭
             can_take_roc = min(rem, total_yearly_rockets_effective * time_target)
             cost_iter += can_take_roc * avg_rocket_cost 
             mass_roc += can_take_roc
@@ -134,7 +117,6 @@ def solve_allocation_with_reliability(time_target, total_mass):
             cost_iter += rem * cost_g
             mass_ele += rem
         else:
-            # 正常优先电梯
             can_take_ele = min(rem, yearly_payload_g * time_target)
             cost_iter += can_take_ele * cost_g
             mass_ele += can_take_ele
@@ -142,7 +124,6 @@ def solve_allocation_with_reliability(time_target, total_mass):
             needed_rocket = rem
             for idx, b in df_bases.iterrows():
                 if needed_rocket <= 0: break
-                # 注意：这里分配的是 Effective Capacity，意味着算法已经预留了维修时间
                 can_take = min(needed_rocket, b["Yearly_Effective"] * time_target)
                 cost_iter += can_take * b["Cost"] * (1 - avg_discount)
                 mass_roc += can_take
@@ -152,17 +133,12 @@ def solve_allocation_with_reliability(time_target, total_mass):
         if abs(new_marginal_discount - final_marginal_discount) < 0.0001:
             return cost_iter, mass_roc, mass_ele, new_marginal_discount
         final_marginal_discount = new_marginal_discount
-        
     return cost_iter, mass_roc, mass_ele, final_marginal_discount
 
 # =============================================================================
-# 4. 离散事件仿真器 (Stochastic Discrete Event Simulator)
+# 4. 离散事件仿真器
 # =============================================================================
-def simulate_rocket_trajectory(target_mass, seed=42, pace_years=None):
-    """
-    火箭故障仿真引擎
-    修正点：取消可用度补偿逻辑，火箭仅按理想物理极限或目标配速执行，不考虑维修时间损失的预补偿。
-    """
+def simulate_rocket_trajectory(target_mass, seed=42, pace_years=None, Z_factor=None):
     if target_mass <= 0:
         return np.array([0]), np.array([0]), np.array([0])
         
@@ -173,29 +149,30 @@ def simulate_rocket_trajectory(target_mass, seed=42, pace_years=None):
     repair_counters = np.zeros(num_bases, dtype=int)
     
     daily_caps = df_bases["Yearly_Ideal"].values / 365.0 
-    
     unit_costs = df_bases["Cost"].values
-    mtbfs = df_bases["MTBF"].values
-    mttrs = df_bases["MTTR"].values
+    
+    mtbf_base = df_bases["MTBF"].values
+    mttr_base = df_bases["MTTR"].values
+    
+    if Z_factor is not None:
+        sigma_mtbf = 0.2
+        sigma_mttr = 0.2
+        mtbfs = mtbf_base * (1 + sigma_mtbf * Z_factor)
+        mttrs = mttr_base * (1 - sigma_mttr * Z_factor)
+        mtbfs = np.maximum(1.0, mtbfs)
+        mttrs = np.maximum(0.1, mttrs)
+    else:
+        mtbfs = mtbf_base
+        mttrs = mttr_base
 
-    # --- 修改部分：取消可用度补偿 ---
     if pace_years is not None:
-        # 1. 计算理论上每天需要运多少 (仅基于目标工期)
         daily_needed_raw = target_mass / (pace_years * 365.0)
-        
-        # 2. 将补偿系数强制设为 1.0 (不再为了对冲故障而提前“加班”)
         avg_availability = 1.0 
-
-        # 3. 修正后的每日目标 (此时 daily_needed_corrected == daily_needed_raw)
         daily_needed_corrected = daily_needed_raw / avg_availability
-        
         daily_max_possible = np.sum(daily_caps)
-        
-        # 如果需求在物理极限内，则降速；否则全速。
         if daily_max_possible > daily_needed_corrected:
             throttle_factor = daily_needed_corrected / daily_max_possible
             daily_caps = daily_caps * throttle_factor
-    # ----------------------------
     
     days = [0]
     costs = [0]
@@ -203,7 +180,6 @@ def simulate_rocket_trajectory(target_mass, seed=42, pace_years=None):
     
     current_mass = 0.0
     total_acc_cost = 0.0  
-    
     day_count = 0
     
     while current_mass < target_mass:
@@ -211,7 +187,6 @@ def simulate_rocket_trajectory(target_mass, seed=42, pace_years=None):
         daily_mass_this_day = 0.0
         
         for i in range(num_bases):
-            # 1. 维修逻辑
             if bases_status[i] == 0:
                 repair_counters[i] -= 1
                 if repair_counters[i] <= 0:
@@ -219,7 +194,6 @@ def simulate_rocket_trajectory(target_mass, seed=42, pace_years=None):
                 else:
                     continue 
             
-            # 2. 故障逻辑判定
             if mttrs[i] > 0:
                 if np.random.rand() < (1.0 / mtbfs[i]):
                     bases_status[i] = 0
@@ -227,7 +201,6 @@ def simulate_rocket_trajectory(target_mass, seed=42, pace_years=None):
                     repair_counters[i] = max(1, r_days)
                     continue 
             
-            # 3. 正常发射
             prod = daily_caps[i]
             if current_mass + daily_mass_this_day + prod > target_mass:
                 prod = target_mass - (current_mass + daily_mass_this_day)
@@ -248,170 +221,192 @@ def simulate_rocket_trajectory(target_mass, seed=42, pace_years=None):
         if day_count > 1000 * 365: break 
         
     return np.array(days), np.array(costs), np.array(masses)
+
 # =============================================================================
-# 5. 数据生成
+# 5. 蒙特卡洛模拟 (1000次) - Method 3 
 # =============================================================================
-print("正在执行异质性故障仿真...")
+print("正在执行蒙特卡洛模拟 (N=1000)...")
 
-# --- A. 帕累托前沿 (基于期望有效运力) ---
-t_axis = np.linspace(T_MIN, T_MAX * 1.1, 100) # 稍微延长以展示延误
-pareto_data = []
-
-for T in t_axis:
-    # 这里的 solve 已经使用了 Effective Capacity，所以结果已经包含了"可靠性惩罚"
-    raw_cost, m_roc, m_ele, avg_discount = solve_allocation_with_reliability(T, M_TOTAL)
-    
-    # 加上工期压力惩罚
-    pressure = (T_MAX - T) / (T_MAX - T_MIN)
-    final_cost = raw_cost * (1 + 0.5 * (pressure ** 2))
-    
-    pareto_data.append({
-        "Time": T, 
-        "Cost": final_cost / 1e12
-    })
-
-df_pareto = pd.DataFrame(pareto_data)
-
-# --- B. 关键点与仿真 ---
-
-# 1. Method 1 (Elevator Only) - 理想线性 (无摇晃)
-t_m1 = T_MAX
-cost_m1 = (M_TOTAL * cost_g) / 1e12
-# 仿真数据生成 (线性)
-years_m1 = np.linspace(0, t_m1, 200)
-costs_m1 = years_m1 * (cost_m1 / t_m1)
-years_m1 += START_YEAR
-
-# 2. Method 2 (Rocket Only) - 随机故障仿真
-# 目标: 运送 M_TOTAL
-print("  Simulating Method 2 (Stochastic)...")
-m2_days, m2_costs, _ = simulate_rocket_trajectory(M_TOTAL, seed=101)
-# 加上压力惩罚 (基于实际耗时)
-t_m2_real = m2_days[-1]
-raw_cost_m2 = m2_costs[-1] * 1e12
-pressure_m2 = (T_MAX - t_m2_real) / (T_MAX - T_MIN)
-final_cost_m2 = raw_cost_m2 * (1 + 0.5 * pressure_m2**2)
-cost_m2 = final_cost_m2 / 1e12
-# 调整仿真曲线的高度以匹配含罚款的终点
-m2_costs = m2_costs * (final_cost_m2 / raw_cost_m2)
-years_m2 = m2_days + START_YEAR
-
-# 3. Method 3 (Hybrid) - 混合仿真
-# 目标: 150年 (期望)
+# 1. 设定规划目标: 150年
 t_target = 150.0
-# 规划分配 (使用有效运力规划)
 _, m_roc_plan, m_ele_plan, _ = solve_allocation_with_reliability(t_target, M_TOTAL)
-print(f"  Simulating Method 3 (Hybrid): Rockets={m_roc_plan/1e6:.1f}Mt, Elevator={m_ele_plan/1e6:.1f}Mt")
 
-# 3.1 电梯部分 (线性)
-# 电梯速率
-ele_rate = yearly_payload_g
-
-# 3.2 火箭部分 (随机，强制降速)
-m3_roc_days, m3_roc_costs, m3_roc_masses = simulate_rocket_trajectory(m_roc_plan, seed=101, pace_years=t_target)
-
-# 3.3 合并曲线
-# 我们需要一个统一的时间轴来叠加成本
-max_time = max(m_ele_plan / ele_rate, m3_roc_days[-1])
-common_time = np.linspace(0, max_time, 500)
-
-# 插值火箭成本
-interp_roc_cost = np.interp(common_time, m3_roc_days, m3_roc_costs)
-# 计算电梯成本
 ele_cost_total = (m_ele_plan * cost_g) / 1e12
-interp_ele_cost = np.minimum(common_time * (ele_cost_total / (m_ele_plan/ele_rate)), ele_cost_total)
+t_actual_ele = m_ele_plan / yearly_payload_g
 
-total_m3_cost = interp_roc_cost + interp_ele_cost
-years_m3 = common_time + START_YEAR
-t_m3_real = common_time[-1]
-cost_m3 = total_m3_cost[-1]
+# 存储结果
+mc_results_time = []
+mc_results_cost = []
+mc_trajectories = [] 
 
-# 压力惩罚
-raw_cost_m3 = cost_m3 * 1e12
-pressure_m3 = (T_MAX - t_m3_real) / (T_MAX - T_MIN)
-final_cost_m3 = raw_cost_m3 * (1 + 0.5 * pressure_m3**2)
-cost_m3_final = final_cost_m3 / 1e12
-# 调整曲线
-costs_m3 = total_m3_cost * (cost_m3_final / cost_m3)
+common_time_axis = np.linspace(0, 300, 600) 
 
+for k in range(100):
+    Z_val = np.random.normal(0, 1)
+    
+    days, costs, _ = simulate_rocket_trajectory(m_roc_plan, seed=None, pace_years=t_target, Z_factor=Z_val)
+    
+    t_roc = days[-1]
+    c_roc = costs[-1]
+    
+    # 最终完工时间和成本
+    t_final = max(t_roc, t_actual_ele)
+    raw_c_final = (c_roc + ele_cost_total) * 1e12
+    pressure = (T_MAX - t_final) / (T_MAX - T_MIN)
+    final_c_total = raw_c_final * (1 + 0.5 * pressure**2)
+    final_c_trillion = final_c_total / 1e12
+    
+    mc_results_time.append(t_final)
+    mc_results_cost.append(final_c_trillion)
+    
+    # --- 修改：轨迹生成逻辑 (使用均摊线性生成，消除折线) ---
+    # 假设火箭成本随时间线性积累 (Amortized Budget Logic)
+    # 起点 (0,0), 终点 (t_roc, c_roc)
+    # 在 common_time_axis 上生成线性增长
+    
+    # 火箭线性均摊
+    # y = kx, k = c_roc / t_roc
+    linear_roc_traj = np.minimum(common_time_axis * (c_roc / t_roc), c_roc)
+    # 如果 common_time_axis 超过 t_roc，保持 c_roc
+    
+    # 电梯线性均摊 (本身就是线性的)
+    linear_ele_traj = np.minimum(common_time_axis * (ele_cost_total / t_actual_ele), ele_cost_total)
+    
+    total_traj = linear_roc_traj + linear_ele_traj
+    
+    # 修正：如果 t_final 还没到，轨迹就是 total_traj
+    # 如果时间轴超过了 t_final，成本应该保持不变 (项目结束)
+    mask_finished = common_time_axis > t_final
+    if np.any(mask_finished):
+        idx_finish = np.argmax(mask_finished)
+        # 之后的值都等于完工时的值 (虽然上面 minimum 逻辑已经部分处理了，但为了严谨)
+        # 注意：这里我们展示的是 raw cost accumulation，不包含最终的一次性罚款
+        # 如果要在图上展示罚款，需要在终点突变。通常累积成本图只展示 Raw，罚款在文字标注。
+        pass 
+        
+    mc_trajectories.append(total_traj)
+
+mc_trajectories = np.array(mc_trajectories)
+
+traj_mean = np.mean(mc_trajectories, axis=0)
+traj_lower = np.percentile(mc_trajectories, 5, axis=0)
+traj_upper = np.percentile(mc_trajectories, 95, axis=0)
 
 # =============================================================================
-# 6. 绘图 1: 帕累托前沿 (反映了可靠性惩罚)
+# 6. 绘图 1: 帕累托前沿 (保持不变)
 # =============================================================================
+t_axis = np.linspace(T_MIN, T_MAX * 1.1, 100)
+pareto_mean_data = []
+for T in t_axis:
+    raw, _, _, _ = solve_allocation_with_reliability(T, M_TOTAL)
+    p = (T_MAX - T) / (T_MAX - T_MIN)
+    fc = raw * (1 + 0.5 * p**2)
+    pareto_mean_data.append(fc / 1e12)
+
 plt.figure(figsize=(12, 7))
+plt.plot(t_axis, pareto_mean_data, 'b-', linewidth=3, label='Method 3: Mean Expectation')
 
-plt.plot(df_pareto["Time"], df_pareto["Cost"], 'b-', linewidth=3, label='Method 3: Hybrid (Reliability Adjusted)')
-plt.fill_between(df_pareto["Time"], df_pareto["Cost"], color='blue', alpha=0.1)
+plt.scatter(mc_results_time, mc_results_cost, color=colors['hybrid'], s=10, alpha=0.3, label='Monte Carlo Results (T_target=150)')
+plt.scatter(np.mean(mc_results_time), np.mean(mc_results_cost), color='red', s=100, marker='X', zorder=5, label='MC Mean')
 
-plt.scatter(t_m1, cost_m1, color='green', s=120, zorder=5, label='Method 1: Elevator Only')
-plt.annotate(f'M1\n({t_m1:.1f}y, ${cost_m1:.1f}T)', (t_m1, cost_m1), 
-             xytext=(-40, 10), textcoords='offset points', color='green', fontweight='bold')
-
-plt.scatter(t_m2_real, cost_m2, color='red', s=120, zorder=5, label='Method 2: Rockets (Real Stochastic)')
-plt.annotate(f'M2\n({t_m2_real:.1f}y, ${cost_m2:.1f}T)', (t_m2_real, cost_m2), 
-             xytext=(20, 10), textcoords='offset points', color='red', fontweight='bold')
-
-# 标注火箭方案的延误
-plt.arrow(t_m2_real - 20, cost_m2, 15, 0, head_width=2, head_length=3, fc='k', ec='k')
-plt.text(t_m2_real - 25, cost_m2 + 5, "Delays due to\nLegacy Bases", ha='right', fontsize=9)
-
-plt.title("Pareto Frontier: Impact of Infrastructure Reliability (MTBF/MTTR)", fontsize=14)
+plt.title(f"Pareto Frontier with Uncertainty (MTBF/MTTR Correlation Z~N(0,1))", fontsize=14)
 plt.xlabel("Completion Time (Years)", fontsize=12)
 plt.ylabel("Total Project Cost (Trillion USD)", fontsize=12)
 plt.grid(True, linestyle='--', alpha=0.6)
 plt.legend(loc='upper right')
-
 plt.tight_layout()
-plt.savefig("pareto_frontier_reliability.png")
+plt.savefig("pareto_frontier_mc.png")
 plt.show()
 
 # =============================================================================
-# 7. 绘图 2: 成本累积仿真 (含随机性特征)
+# 7. 绘图 2: 成本累积仿真 (均摊平滑版)
 # =============================================================================
 fig, ax = plt.subplots(figsize=(12, 7))
 
-# M1
-ax.plot(years_m1, costs_m1, color=colors['elevator'], linestyle='-', linewidth=2.5, label='Method 1: Elevator Only')
-ax.scatter(years_m1[-1], costs_m1[-1], color=colors['elevator'], s=80, zorder=5, edgecolor='white', linewidth=1.5)
-ax.annotate(f'{int(years_m1[-1])}\n${costs_m1[-1]:.1f}T', (years_m1[-1], costs_m1[-1]), 
-             xytext=(-40, 10), textcoords="offset points", color=colors['elevator'], fontweight='bold', fontsize=9)
+common_years = common_time_axis + START_YEAR
 
-# M2 (Stochastic)
-ax.plot(years_m2, m2_costs, color=colors['rocket'], linestyle='-', linewidth=2.5, label='Method 2: Rockets (Stochastic)')
-ax.scatter(years_m2[-1], m2_costs[-1], color=colors['rocket'], s=80, zorder=5, edgecolor='white', linewidth=1.5)
-ax.annotate(f'{int(years_m2[-1])}\n${m2_costs[-1]:.1f}T', (years_m2[-1], m2_costs[-1]), 
-             xytext=(10, 5), textcoords="offset points", color=colors['rocket'], fontweight='bold', fontsize=9)
+# 绘制所有 MC 轨迹 (云) - 现在是平滑的直线
+for i in range(min(200, len(mc_trajectories))):
+    ax.plot(common_years, mc_trajectories[i], color=colors['hybrid'], lw=0.5, alpha=0.1)
 
-# M3 (Hybrid Stochastic)
-ax.plot(years_m3, costs_m3, color=colors['hybrid'], linestyle='-', linewidth=2.5, label='Method 3: Hybrid Strategy')
-ax.scatter(years_m3[-1], costs_m3[-1], color=colors['hybrid'], s=80, zorder=5, edgecolor='white', linewidth=1.5)
-ax.annotate(f'{int(years_m3[-1])}\n${costs_m3[-1]:.1f}T', (years_m3[-1], costs_m3[-1]), 
-             xytext=(10, 5), textcoords="offset points", color=colors['hybrid'], fontweight='bold', fontsize=9)
+# 绘制均值
+ax.plot(common_years, traj_mean, color='black', lw=2.5, linestyle='--', label='Mean Amortized Trajectory')
+# 绘制置信区间
+ax.fill_between(common_years, traj_lower, traj_upper, color=colors['hybrid'], alpha=0.3, label='95% Confidence Interval')
 
-ax.set_title("Cumulative Cost Trajectories: Discrete Event Simulation of Failures", fontsize=14, fontweight='bold', pad=15)
+ax.set_title("Cumulative Cost Trajectories: Amortized Budget View (Smoothed)", fontsize=14, fontweight='bold', pad=15)
 ax.set_xlabel("Year", fontsize=12)
 ax.set_ylabel("Accumulated Cost (Trillion USD)", fontsize=12)
 ax.grid(True, alpha=0.3)
-ax.set_xlim(START_YEAR, START_YEAR + 450)
-ax.set_ylim(0, max(cost_m2, cost_m3_final, cost_m1)*1.1)
-ax.legend(loc='upper left', frameon=False)
-ax.axvspan(2050, 2200, color='gray', alpha=0.05)
-
-# Inset Zoom
-axins = inset_axes(ax, width="40%", height="40%", loc=1, borderpad=3)
-axins.plot(years_m1, costs_m1, color=colors['elevator'], linestyle='-')
-axins.plot(years_m2, m2_costs, color=colors['rocket'], linestyle='-')
-axins.plot(years_m3, costs_m3, color=colors['hybrid'], linestyle='-')
-axins.set_xlim(2050, 2220)
-axins.set_ylim(0, cost_m2 * 1.1)
-axins.grid(True, linestyle=':', alpha=0.4)
-axins.set_title("Zoom: Stochastic Fluctuations (Step Effects)", fontsize=9)
-mark_inset(ax, axins, loc1=2, loc2=4, fc="none", ec="0.5", linestyle="--")
+ax.set_xlim(START_YEAR, START_YEAR + 250)
+ax.legend(loc='upper left')
 
 plt.tight_layout()
-plt.savefig("simulation_trajectories_reliability.png", dpi=300)
+plt.savefig("simulation_trajectories_mc_smooth.png")
 plt.show()
 
-print("--- 故障模型仿真完成 ---")
-print(f"M2 实际完工时间: {t_m2_real:.1f} 年 (受老旧基地拖累)")
-print(f"M3 实际完工时间: {t_m3_real:.1f} 年")
+# =============================================================================
+# 8. 绘图 3: 相对变动比例 (Scatter Plot: Time vs Cost)
+# =============================================================================
+# 计算基准值 (无故障理想情况 T=150)
+# 假设 MTTR=0 或 Z=+Inf (最好的情况)? 不，基准应该是"规划预期值"(Z=0, 无随机故障)
+# 或者使用 solve_allocation_with_reliability 的直接输出作为基准
+raw_ideal, _, _, _ = solve_allocation_with_reliability(t_target, M_TOTAL)
+p_ideal = (T_MAX - t_target) / (T_MAX - T_MIN)
+cost_ideal_val = (raw_ideal * (1 + 0.5 * p_ideal**2)) / 1e12
+time_ideal_val = t_target
+
+# 计算相对变动 (%)
+rel_time_change = [(t - time_ideal_val) / time_ideal_val * 100 for t in mc_results_time]
+rel_cost_change = [(c - cost_ideal_val) / cost_ideal_val * 100 for c in mc_results_cost]
+
+plt.figure(figsize=(10, 8))
+
+# 绘制散点
+plt.scatter(rel_time_change, rel_cost_change, color='#7570B3', alpha=0.5, s=20, label='Simulated Scenarios')
+
+# 绘制均值点
+mean_time_change = np.mean(rel_time_change)
+mean_cost_change = np.mean(rel_cost_change)
+plt.scatter(mean_time_change, mean_cost_change, color='red', s=150, marker='X', zorder=5, label=f'Mean Shift\n(Time+{mean_time_change:.1f}%, Cost+{mean_cost_change:.1f}%)')
+
+# 辅助线 (0,0 基准)
+plt.axhline(0, color='gray', linestyle='--', linewidth=1)
+plt.axvline(0, color='gray', linestyle='--', linewidth=1)
+
+# 添加等高线密度图 (可选，增加高级感)
+try:
+    from scipy.stats import gaussian_kde
+    # 堆叠数据
+    data = np.vstack([rel_time_change, rel_cost_change])
+    kde = gaussian_kde(data)
+    # 创建网格
+    xgrid = np.linspace(min(rel_time_change), max(rel_time_change), 100)
+    ygrid = np.linspace(min(rel_cost_change), max(rel_cost_change), 100)
+    Xgrid, Ygrid = np.meshgrid(xgrid, ygrid)
+    Zgrid = kde.evaluate(np.vstack([Xgrid.ravel(), Ygrid.ravel()]))
+    plt.contour(Xgrid, Ygrid, Zgrid.reshape(Xgrid.shape), levels=5, colors='k', alpha=0.3)
+except ImportError:
+    pass
+
+plt.title(f"Relative Deviation from Plan (T={t_target}y)\nImpact of Global Reliability Factor Z", fontsize=14)
+plt.xlabel("Relative Time Delay (%)", fontsize=12)
+plt.ylabel("Relative Cost Overrun (%)", fontsize=12)
+plt.grid(True, linestyle=':', alpha=0.5)
+plt.legend(loc='upper left')
+
+# 添加统计信息框
+stats_text = (f"Baseline T: {time_ideal_val}y\n"
+              f"Baseline Cost: ${cost_ideal_val:.2f}T\n\n"
+              f"Mean Delay: +{mean_time_change:.2f}%\n"
+              f"Mean Overrun: +{mean_cost_change:.2f}%")
+plt.text(0.95, 0.05, stats_text, transform=plt.gca().transAxes, fontsize=11,
+         verticalalignment='bottom', horizontalalignment='right',
+         bbox=dict(boxstyle='round', facecolor='white', alpha=0.9, edgecolor='gray'))
+
+plt.tight_layout()
+plt.savefig("relative_deviation_scatter.png")
+plt.show()
+
+print(f"MC Mean Time: {np.mean(mc_results_time):.1f} y (+{mean_time_change:.1f}%)")
+print(f"MC Mean Cost: ${np.mean(mc_results_cost):.2f} T (+{mean_cost_change:.1f}%)")

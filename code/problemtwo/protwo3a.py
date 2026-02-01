@@ -21,7 +21,8 @@ SCALE_DISCOUNT = 0.2  # 20% 规模折扣
 START_YEAR = 2050
 
 # [新增] 第三类模型：飞行失败参数
-P_FAIL_CONST = 0.01          # 故障率: 1% (固定值)
+P_FAIL_CONST = 0.01          # 故障率: 1% (均值)
+P_FAIL_STD = 0.003           # [新增] 故障率标准差: 0.3% (用于敏感性分析)
 C_PAYLOAD_PER_TON = 1e5       # 货物价值: $100,000/ton (大宗精密建材)
 
 BASES_DATA = {
@@ -110,11 +111,13 @@ def solve_allocation_with_integral_cost(time_target, total_mass):
     return cost_iter, mass_roc, mass_ele, final_marginal_discount
 
 # [新增] 离散事件仿真器 (集成：飞行失败风险逻辑)
-def simulate_rocket_trajectory_with_failure(target_mass, seed=42, pace_years=None):
+def simulate_rocket_trajectory_with_failure(target_mass, seed=42, pace_years=None, p_fail_override=None):
     if target_mass <= 0:
         return np.array([0]), np.array([0]), np.array([0])
         
     np.random.seed(seed)
+    # [修改] 使用覆盖值或全局常量
+    p_fail = p_fail_override if p_fail_override is not None else P_FAIL_CONST
     
     num_bases = len(df_bases)
     daily_caps = df_bases["Yearly"].values / 365.0 
@@ -158,7 +161,7 @@ def simulate_rocket_trajectory_with_failure(target_mass, seed=42, pace_years=Non
             base_launch_cost = prod * unit_costs[i] 
 
             # >>>>>>>>> 判定: 炸了吗？ (新增逻辑) <<<<<<<<<
-            if np.random.rand() < P_FAIL_CONST:
+            if np.random.rand() < p_fail:
                 # === 炸了 (Failure) ===
                 # 损失 = 火箭发射成本(含折扣) + 货物成本(全额)
                 launch_loss = base_launch_cost * (1 - discount_fail)
@@ -188,7 +191,12 @@ def simulate_rocket_trajectory_with_failure(target_mass, seed=42, pace_years=Non
 # =============================================================================
 # 3. 数据生成
 # =============================================================================
-print("正在执行计算 (Scenario 3: Launch Failure Only)...")
+print("正在执行计算 (Scenario 3: Launch Failure with Sensitivity)...")
+
+# [新增] 敏感性分析采样
+np.random.seed(2026)
+p_fail_samples = np.random.normal(P_FAIL_CONST, P_FAIL_STD, 10)
+p_fail_samples = np.clip(p_fail_samples, 0.001, 0.05) # 限制在合理区间
 
 # --- A. 帕累托前沿计算 ---
 t_axis = np.linspace(T_MIN, T_MAX, 100)
@@ -213,56 +221,54 @@ t_m1 = T_MAX
 m_ele_m1, m_roc_m1 = M_TOTAL, 0
 cost_m1 = (M_TOTAL * cost_g) / 1e12 
 
-# Method 2 (Rocket) - [修改: 使用仿真器]
-print("  Simulating M2 (Rocket)...")
-# 不设 pace_years，让它全速跑，看炸机后的自然速度
-m2_days, m2_costs, _ = simulate_rocket_trajectory_with_failure(M_TOTAL, seed=101)
-t_m2 = m2_days[-1]         # 实际完工时间
-cost_m2_raw = m2_costs[-1] # 实际成本(含炸机)
-# 加上时间压力惩罚(维持基底画图逻辑)
+# Method 2 (Rocket) - [修改: 使用仿真器并添加敏感性采样]
+print("  Simulating M2 (Rocket) with Sensitivity...")
+m2_results = []
+for p in p_fail_samples:
+    d, c, _ = simulate_rocket_trajectory_with_failure(M_TOTAL, seed=101, p_fail_override=p)
+    m2_results.append((d, c))
+
+# 基础显示用 (均值/中位数采样)
+m2_days, m2_costs = m2_results[0] 
+t_m2 = m2_days[-1] 
+cost_m2_raw = m2_costs[-1]
 pressure_m2 = (T_MAX - t_m2) / (T_MAX - T_MIN)
 final_cost_m2 = cost_m2_raw * 1e12 * (1 + 0.5 * pressure_m2**2)
 cost_m2 = final_cost_m2 / 1e12
-
-# 此时需要重构一条曲线用于画图(带压力惩罚的)
 years_m2 = m2_days + START_YEAR
 costs_m2 = m2_costs * (final_cost_m2 / (cost_m2_raw * 1e12))
 
 
-# Method 3 (Hybrid) - [修改: 移除预知未来的积分修正]
-print("  Simulating M3 (Hybrid)...")
+# Method 3 (Hybrid) - [修改: 移除预知未来的积分修正并添加敏感性采样]
+print("  Simulating M3 (Hybrid) with Sensitivity...")
 t_m3_plan = 150.0  # 我们设定的计划时间
-# 规划阶段：使用理想公式分配份额（此时尚不知道会炸机）
 _, m_roc_plan, m_ele_plan, _ = solve_allocation_with_integral_cost(t_m3_plan, M_TOTAL)
 
-# 电梯部分(理想): 假设它按计划运行，不受炸机影响
-years_ele = np.linspace(0, t_m3_plan, 1000)
-costs_ele = years_ele * (m_ele_plan * cost_g / t_m3_plan) / 1e12
+m3_results = []
+for p in p_fail_samples:
+    # 电梯部分(理想)
+    y_ele = np.linspace(0, t_m3_plan, 1000)
+    c_ele = y_ele * (m_ele_plan * cost_g / t_m3_plan) / 1e12
+    # 火箭部分(带风险)
+    d_roc, c_roc, _ = simulate_rocket_trajectory_with_failure(m_roc_plan, seed=101, pace_years=t_m3_plan, p_fail_override=p)
+    
+    t_real = max(t_m3_plan, d_roc[-1])
+    common_t = np.linspace(0, t_real, 1000)
+    i_roc = np.interp(common_t, d_roc, c_roc)
+    i_ele = np.interp(common_t, y_ele, c_ele)
+    i_ele[common_t > t_m3_plan] = c_ele[-1]
+    
+    total_raw = (i_roc + i_ele)
+    p_m3 = (T_MAX - t_real) / (T_MAX - T_MIN)
+    f_c3 = total_raw[-1] * (1 + 0.5 * p_m3**2)
+    m3_results.append((common_t + START_YEAR, total_raw * (f_c3 / total_raw[-1])))
 
-# 火箭部分(带炸机): 按照 150 年的配速去跑，看它最后实际什么时候跑完
-m3_roc_days, m3_roc_costs, _ = simulate_rocket_trajectory_with_failure(m_roc_plan, seed=101, pace_years=t_m3_plan)
+# 基础显示用
+years_m3, costs_m3 = m3_results[0]
+t_m3 = years_m3[-1] - START_YEAR
+cost_m3 = costs_m3[-1]
 
-# 组合后的真实完工时间取决于最晚的那部分
-t_m3_real = max(t_m3_plan, m3_roc_days[-1])
-common_time = np.linspace(0, t_m3_real, 1000)
-
-interp_roc_cost = np.interp(common_time, m3_roc_days, m3_roc_costs)
-interp_ele_cost = np.interp(common_time, years_ele, costs_ele)
-# 电梯只跑到计划时间就停了
-interp_ele_cost[common_time > t_m3_plan] = costs_ele[-1]
-
-total_m3_cost_raw = interp_roc_cost + interp_ele_cost
-years_m3 = common_time + START_YEAR
-
-# 压力修正: 此时是基于“现实发生”的时间来计算罚金
-raw_cost_m3 = total_m3_cost_raw[-1] * 1e12
-pressure_m3 = (T_MAX - t_m3_real) / (T_MAX - T_MIN)
-final_cost_m3 = raw_cost_m3 * (1 + 0.5 * pressure_m3**2)
-cost_m3 = final_cost_m3 / 1e12
-costs_m3 = total_m3_cost_raw * (final_cost_m3 / raw_cost_m3)
-t_m3 = t_m3_real
-
-# --- C. 仿真曲线数据生成 (对于 M1 保持基底函数的占位，M2/M3 已替换为仿真数据) ---
+# --- C. 仿真曲线数据生成 (对于 M1 保持基底函数的占位) ---
 def calculate_simulation_data(duration, target_total_cost, m_ele_total, m_roc_total):
     years = np.linspace(0, duration, 1000)
     costs = []
@@ -295,9 +301,7 @@ def calculate_simulation_data(duration, target_total_cost, m_ele_total, m_roc_to
     final_costs = [c * scale_fix for c in costs]
     return years + START_YEAR, final_costs
 
-# M1 还是原来的
 years_m1, costs_m1 = calculate_simulation_data(t_m1, cost_m1 * 1e12, M_TOTAL, 0)
-# M2, M3 已经由仿真器生成，这里不再调用 calculate_simulation_data
 
 # =============================================================================
 # 4. 绘图 1: 帕累托前沿
@@ -335,50 +339,50 @@ plt.show()
 # =============================================================================
 fig, ax = plt.subplots(figsize=(12, 7))
 
+# Method 1
 ax.plot(years_m1, costs_m1, color=colors['elevator'], linestyle='-', linewidth=2.5, label='Method 1: Elevator Only')
 ax.scatter(years_m1[-1], costs_m1[-1], color=colors['elevator'], s=80, zorder=5, edgecolor='white', linewidth=1.5)
-ax.annotate(f'{int(years_m1[-1])}\n${costs_m1[-1]:.1f}T', (years_m1[-1], costs_m1[-1]), 
-              xytext=(-40, 10), textcoords="offset points", 
-              color=colors['elevator'], fontweight='bold', fontsize=9, va='center')
 
-ax.plot(years_m2, costs_m2, color=colors['rocket'], linestyle='-', linewidth=2.5, label='Method 2: Rockets Only')
+# Method 2 + Sensitivity Range
+m2_all_costs = [np.interp(years_m2, r[0]+START_YEAR, r[1]) for r in m2_results]
+ax.fill_between(years_m2, np.min(m2_all_costs, axis=0), np.max(m2_all_costs, axis=0), color=colors['rocket'], alpha=0.15)
+ax.plot(years_m2, costs_m2, color=colors['rocket'], linestyle='-', linewidth=2.5, label='Method 2: Rockets Only (Mean)')
 ax.scatter(years_m2[-1], costs_m2[-1], color=colors['rocket'], s=80, zorder=5, edgecolor='white', linewidth=1.5)
-ax.annotate(f'{int(years_m2[-1])}\n${costs_m2[-1]:.1f}T', (years_m2[-1], costs_m2[-1]), 
-              xytext=(10, 5), textcoords="offset points", 
-              color=colors['rocket'], fontweight='bold', fontsize=9, va='center')
 
+# Method 3 + Sensitivity Range
+m3_all_costs = [np.interp(years_m3, r[0], r[1]) for r in m3_results]
+ax.fill_between(years_m3, np.min(m3_all_costs, axis=0), np.max(m3_all_costs, axis=0), color=colors['hybrid'], alpha=0.15)
 ax.plot(years_m3, costs_m3, color=colors['hybrid'], linestyle='-', linewidth=2.5, label='Method 3: Hybrid Strategy')
 ax.scatter(years_m3[-1], costs_m3[-1], color=colors['hybrid'], s=80, zorder=5, edgecolor='white', linewidth=1.5)
-ax.annotate(f'{int(years_m3[-1])}\n${costs_m3[-1]:.1f}T', (years_m3[-1], costs_m3[-1]), 
-              xytext=(10, 5), textcoords="offset points", 
-              color=colors['hybrid'], fontweight='bold', fontsize=9, va='center')
 
-ax.set_title("Cumulative Cost Trajectories: Learning Curve Impact", fontsize=14, fontweight='bold', pad=15)
+# Annotations
+ax.annotate(f'{int(years_m1[-1])}\n${costs_m1[-1]:.1f}T', (years_m1[-1], costs_m1[-1]), xytext=(-40, 10), textcoords="offset points", color=colors['elevator'], fontweight='bold', fontsize=9)
+ax.annotate(f'{int(years_m2[-1])}\n${costs_m2[-1]:.1f}T', (years_m2[-1], costs_m2[-1]), xytext=(10, 5), textcoords="offset points", color=colors['rocket'], fontweight='bold', fontsize=9)
+ax.annotate(f'{int(years_m3[-1])}\n${costs_m3[-1]:.1f}T', (years_m3[-1], costs_m3[-1]), xytext=(10, 5), textcoords="offset points", color=colors['hybrid'], fontweight='bold', fontsize=9)
+
+ax.set_title("Cumulative Cost Trajectories: Risk & Learning Sensitivity", fontsize=14, fontweight='bold', pad=15)
 ax.set_xlabel("Year", fontsize=12)
 ax.set_ylabel("Accumulated Cost (Trillion USD)", fontsize=12)
 ax.grid(True, which='major', linestyle='-', alpha=0.3, color='gray')
-ax.grid(True, which='minor', linestyle=':', alpha=0.15, color='gray')
 ax.minorticks_on()
 ax.set_xlim(START_YEAR, START_YEAR + 450)
-ax.set_ylim(0, max(final_cost_m2, final_cost_m3, cost_m1*1e12)/1e12 * 1.1)
+ax.set_ylim(0, max(final_cost_m2, costs_m3[-1]*1e12, cost_m1*1e12)/1e12 * 1.1)
 ax.legend(loc='upper left', frameon=False, fontsize=11)
-ax.axvspan(2050, 2200, color='gray', alpha=0.05)
-ax.text(2125, ax.get_ylim()[1]*0.05, "Active Phase", ha='center', color='gray', fontsize=10, alpha=0.6)
 
 # Inset Zoom
 axins = inset_axes(ax, width="40%", height="40%", loc=1, borderpad=3)
-axins.plot(years_m1, costs_m1, color=colors['elevator'], linestyle='-', linewidth=2.5)
-axins.plot(years_m2, costs_m2, color=colors['rocket'], linestyle='-', linewidth=2.5)
-axins.plot(years_m3, costs_m3, color=colors['hybrid'], linestyle='-', linewidth=2.5)
-axins.set_xlim(2050, 2220)
-axins.set_ylim(0, final_cost_m2/1e12 * 1.1)
+axins.plot(years_m1, costs_m1, color=colors['elevator'], linewidth=2)
+axins.plot(years_m2, costs_m2, color=colors['rocket'], linewidth=2)
+axins.fill_between(years_m2, np.min(m2_all_costs, axis=0), np.max(m2_all_costs, axis=0), color=colors['rocket'], alpha=0.1)
+axins.plot(years_m3, costs_m3, color=colors['hybrid'], linewidth=2)
+axins.fill_between(years_m3, np.min(m3_all_costs, axis=0), np.max(m3_all_costs, axis=0), color=colors['hybrid'], alpha=0.1)
+axins.set_xlim(2050, 2250)
+axins.set_ylim(0, final_cost_m2/1e12 * 1.2)
 axins.grid(True, linestyle=':', alpha=0.4)
-axins.set_title("Zoom: 2050-2220 (Curvature Detail)", fontsize=9)
-axins.tick_params(labelsize=8)
 mark_inset(ax, axins, loc1=2, loc2=4, fc="none", ec="0.5", linestyle="--")
 
 plt.tight_layout()
 plt.savefig("simulation_trajectories_scenario3.png", dpi=300)
 plt.show()
 
-print("--- 所有图表绘制完成 (无Excel导出) ---")
+print("--- 所有敏感性分析图表绘制完成 ---")

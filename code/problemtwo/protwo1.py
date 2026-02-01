@@ -36,47 +36,29 @@ colors = {
 }
 
 # =============================================================================
-# 2. LHS 采样与截断正态分布生成器 (新增模块)
+# 2. 蒙特卡洛采样 (Monte Carlo) 与截断正态分布生成器 (修改模块)
 # =============================================================================
-def generate_lhs_samples(n_samples=50, mean=1.05, std=0.05, lower_bound=1.0):
+def generate_monte_carlo_samples(n_samples=5000, mean=1.05, std=0.05, lower_bound=1.0):
     """
-    生成符合截断正态分布的 LHS 样本 Y (摇晃系数)
+    使用高数量蒙特卡洛 (Monte Carlo) 方法生成截断正态分布样本 Y
     Y >= 1.0, 位于分母, Y越大运力越低
     """
-    # 1. 生成 [0, 1] 之间的均匀分布 LHS 样本
-    # 将概率空间分成 n_samples 份
-    intervals = np.linspace(0, 1, n_samples + 1)
-    # 在每个区间内随机取一个点
-    points = np.random.uniform(intervals[:-1], intervals[1:], n_samples)
-    # 打乱顺序 (虽然一维不需要打乱，但为了严谨性)
-    np.random.shuffle(points)
+    # 1. 直接生成大量正态分布样本 (为了应对截断，预生成 1.5 倍)
+    raw_count = int(n_samples * 1.5)
+    raw_samples = np.random.normal(mean, std, raw_count)
     
-    # 2. 使用逆变换采样 (Inverse Transform Sampling) 将均匀分布映射到正态分布
-    # 这里我们手动实现一个简单的映射逻辑，或者直接利用截断逻辑
-    # 为了简单且不引入 scipy，我们使用 Accept-Reject 策略配合 LHS 的分层思想
-    # 但为了保证 LHS 的均匀性，最佳方法是直接映射：
+    # 2. 物理截断 (Reject samples < 1.0)
+    # 这就是蒙特卡洛的本质：随机生成，不符合条件的扔掉
+    valid_samples = raw_samples[raw_samples >= lower_bound]
     
-    # 既然不能用 scipy.stats.norm.ppf，我们用 numpy 近似或直接采样后排序匹配
-    # 方法：生成大量正态分布随机数，截断，然后取分位数匹配 LHS 的 points
+    # 3. 如果有效样本不够，循环补充
+    while len(valid_samples) < n_samples:
+        more_samples = np.random.normal(mean, std, raw_count)
+        valid_samples = np.concatenate([valid_samples, more_samples[more_samples >= lower_bound]])
     
-    pool_size = n_samples * 100
-    raw_pool = np.random.normal(mean, std, pool_size)
-    valid_pool = raw_pool[raw_pool >= lower_bound] # 截断
-    
-    # 如果有效池不够，继续生成 (极小概率)
-    while len(valid_pool) < n_samples:
-        more = np.random.normal(mean, std, pool_size)
-        valid_pool = np.concatenate([valid_pool, more[more >= lower_bound]])
-    
-    # 排序有效池
-    valid_pool.sort()
-    
-    # 根据 LHS 的 points (百分比位置) 选取对应的值
-    # 比如 points=[0.1, 0.5, 0.9], 我们就取 valid_pool 中第 10%, 50%, 90% 位置的数
-    indices = (points * len(valid_pool)).astype(int)
-    lhs_samples = valid_pool[indices]
-    
-    return lhs_samples
+    # 4. 取前 n_samples 个
+    # 蒙特卡洛不需要排序或分层，保持随机性即可
+    return valid_samples[:n_samples]
 
 # =============================================================================
 # 3. 核心计算函数
@@ -157,11 +139,11 @@ def solve_allocation_with_integral_cost(time_target, total_mass, sway_Y=1.0):
     return cost_iter, mass_roc, mass_ele, final_marginal_discount
 
 # =============================================================================
-# 4. 执行 LHS 采样与不确定性分析
+# 4. 执行 高数量蒙特卡洛采样 与不确定性分析
 # =============================================================================
-print("执行 LHS 采样与不确定性分析...")
-N_SAMPLES = 50 # 样本数
-sway_samples = generate_lhs_samples(n_samples=N_SAMPLES, mean=1.05, std=0.1, lower_bound=1.0)
+print("执行 高数量蒙特卡洛采样 (Monte Carlo Simulation)...")
+N_SAMPLES = 5000 # 设定为高数量 (从 50 增加到 5000)
+sway_samples = generate_monte_carlo_samples(n_samples=N_SAMPLES, mean=1.05, std=0.05, lower_bound=1.0)
 
 # 用于存储多次仿真的结果
 pareto_runs = []    # 存储每次 Method 3 的帕累托曲线
@@ -179,7 +161,7 @@ c_m2_raw *= (1 - avg_discount_m2)
 pressure_m2 = (T_MAX_NOMINAL - t_m2) / (T_MAX_NOMINAL - T_MIN)
 final_cost_m2 = c_m2_raw * (1 + 0.5 * pressure_m2**2)
 
-# 2. 循环计算 LHS 样本 (Method 1 & 3)
+# 2. 循环计算 Monte Carlo 样本 (Method 1 & 3)
 t_axis = np.linspace(T_MIN, T_MAX_NOMINAL * 1.5, 100) # 稍微延长坐标轴以容纳更慢的情况
 
 for Y_val in sway_samples:
@@ -246,7 +228,7 @@ plt.scatter(M_TOTAL/yearly_payload_g_nominal, (M_TOTAL*cost_g)/1e12, color='gree
 # 绘制 Method 2 (固定点)
 plt.scatter(t_m2, final_cost_m2/1e12, color='red', s=120, edgecolors='black', zorder=5, label='Method 2: Rockets Only (Robust)')
 
-plt.title("Pareto Frontier under Elevator Sway Uncertainty (LHS Sampling)", fontsize=14)
+plt.title("Pareto Frontier under Elevator Sway Uncertainty (Monte Carlo, N=5000)", fontsize=14)
 plt.xlabel("Completion Time (Years)", fontsize=12)
 plt.ylabel("Total Project Cost (Trillion USD)", fontsize=12)
 plt.grid(True, linestyle='--', alpha=0.6)
@@ -305,6 +287,8 @@ def get_curve(duration, total_cost, m_ele, m_roc, sway_Y=1.0):
 # 选取标称时间 T=150 进行多次仿真
 t_target = 150.0
 sim_curves_m3 = []
+# 为了绘图效率，如果样本太多，只画前 200 个样本的轨迹用于置信区间计算，或者全部计算
+# 这里全部计算
 for Y_val in sway_samples:
     raw, m_r, m_e, _ = solve_allocation_with_integral_cost(t_target, M_TOTAL, sway_Y=Y_val)
     pres = (T_MAX_NOMINAL - t_target) / (T_MAX_NOMINAL - T_MIN)
@@ -372,4 +356,73 @@ plt.tight_layout()
 plt.savefig("simulation_trajectories_uncertainty.png", dpi=300)
 plt.show()
 
-print("--- 不确定性分析完成 ---")
+# =============================================================================
+# 7. (新增) T=150 成本分布敏感度分析图
+# =============================================================================
+print(f"正在计算 T=150 的成本分布敏感度...")
+
+# 1. 设定目标参数
+target_T = 150.0
+costs_at_150 = []
+
+# 2. 计算该时间点的压力惩罚系数 (对所有样本统一，因为 T 固定)
+# 注意：T_MAX_NOMINAL 和 T_MIN 是之前全局计算好的变量，直接调用
+pressure_150 = max(0, (T_MAX_NOMINAL - target_T) / (T_MAX_NOMINAL - T_MIN))
+penalty_factor_150 = 1 + 0.5 * (pressure_150 ** 2)
+
+# 3. 遍历之前的 Monte Carlo 样本重新计算成本
+for Y_val in sway_samples:
+    # 复用之前的核心求解器
+    raw_cost, _, _, _ = solve_allocation_with_integral_cost(target_T, M_TOTAL, sway_Y=Y_val)
+    
+    # 应用压力惩罚
+    final_c = raw_cost * penalty_factor_150
+    costs_at_150.append(final_c / 1e12) # 转换为万亿美元
+
+# 4. 绘图：成本分布直方图 + 密度曲线
+plt.figure(figsize=(9, 6))
+
+# 绘制直方图 (样本多，bin可以多一点)
+counts, bins, patches = plt.hist(costs_at_150, bins=50, color='#7570B3', alpha=0.6, 
+                                 edgecolor='black', density=True, label='Frequency')
+
+# 尝试绘制核密度估计曲线 (KDE) 以显示"变化的相对程度"
+try:
+    from scipy.stats import gaussian_kde
+    density = gaussian_kde(costs_at_150)
+    xs = np.linspace(min(costs_at_150), max(costs_at_150), 200)
+    plt.plot(xs, density(xs), color='red', linestyle='--', linewidth=2, label='Probability Density')
+except ImportError:
+    pass # 如果没有 scipy 就不画曲线，不影响直方图
+
+# 5. 计算并标注统计指标 (量化相对变化)
+mean_cost = np.mean(costs_at_150)
+std_cost = np.std(costs_at_150)
+cv_cost = (std_cost / mean_cost) * 100 # 变异系数 (Coefficient of Variation)
+
+# 绘制均值线
+plt.axvline(mean_cost, color='k', linestyle='dashed', linewidth=1.5, label=f'Mean Cost: {mean_cost:.2f}T')
+
+# 图表装饰
+plt.title(f"Cost Uncertainty Distribution at T={target_T} Years\n(Monte Carlo N={N_SAMPLES}, Truncated Normal Input)", fontsize=14, fontweight='bold')
+plt.xlabel("Total Project Cost (Trillion USD)", fontsize=12)
+plt.ylabel("Probability Density", fontsize=12)
+plt.grid(True, linestyle=':', alpha=0.5)
+
+# 在图表中插入文本框，显示相对浮动程度
+text_str = (f"Target Time: {target_T} Years\n"
+            f"Mean Cost: {mean_cost:.3f}T\n"
+            f"Std Dev: {std_cost:.3f}T\n"
+            f"Relative Variation (CV): {cv_cost:.2f}%")
+
+plt.text(0.95, 0.95, text_str, transform=plt.gca().transAxes, fontsize=11,
+         verticalalignment='top', horizontalalignment='right',
+         bbox=dict(boxstyle='round', facecolor='white', alpha=0.9, edgecolor='gray'))
+
+plt.legend(loc='upper left')
+plt.tight_layout()
+plt.savefig("cost_distribution_at_150.png", dpi=300)
+plt.show()
+
+print(f"T={target_T} 的成本分布图已生成: cost_distribution_at_150.png")
+print("--- 高数量蒙特卡洛分析完成 ---")

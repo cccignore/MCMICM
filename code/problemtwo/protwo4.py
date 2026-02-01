@@ -7,7 +7,7 @@ from mpl_toolkits.axes_grid1.inset_locator import inset_axes, mark_inset
 # 1. 基础参数与设置
 # =============================================================================
 M_TOTAL = 1e8
-G0, MU, RE, RGEO = 9.80665, 398600.44, 6378.0, 42164.0
+G0, MU, RE, RGEO = 9.80665, 398600.44, 6378.0, 106378.0
 V_ROT_EQUATOR = 0.4651
 ALPHA_G, ALPHA_E = 0.3, 0.6
 L_MAX = 6000.0
