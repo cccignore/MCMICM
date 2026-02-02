@@ -208,6 +208,48 @@ def calculate_social_total(phy_res, duration):
     
     return c_atmosphere + c_resource + c_indirect
 
+def calculate_social_breakdown(phy_res, duration):
+    # 1. 物理量提取
+    m_ele = phy_res["mass_ele"]
+    fuel_E = phy_res["fuel_E"]
+    dry_E = phy_res["dry_E"]
+    
+    # 电梯二段消耗
+    fuel_G = m_ele * mu_fuel_g
+    dry_G = m_ele * mu_dry_g
+    
+    # 电力消耗
+    delta_epsilon = MU * (1/RE - 1/RGEO) * 1e6
+    kwh_total = (m_ele * k_g * 1000 * delta_epsilon) / (ETA_E * 3.6e6)
+    
+    # 2. 计算各环境分项
+    # (A) 大气
+    c_ghg = fuel_E * EF_CO2 * (SCC_2050 / 1000.0) 
+    c_bc = fuel_E * EF_BC * GWP_BC * PSI_STRATO * SCC_2050
+    c_ozone = fuel_E * ((EF_NOX * ODP_NOX) + (EF_BC * ODP_BC)) * SC_OZONE
+    c_atmosphere = c_ghg + c_bc + c_ozone
+    
+    # (B) 资源
+    total_fuel = fuel_E + fuel_G
+    total_material = dry_E + dry_G
+    c_scarcity = total_fuel * TAX_SCARCITY
+    c_alloy = total_material * P_ALLOY
+    c_resource = c_scarcity + c_alloy
+    
+    # (C) 间接
+    c_elec = kwh_total * CI_GRID * (SCC_2050 / 1000.0)
+    total_maint_co2 = duration * (MAINT_ELE_CO2 + phy_res["active_bases"] * MAINT_BASE_CO2)
+    c_maint = total_maint_co2 * SCC_2050
+    c_indirect = c_elec + c_maint
+    
+    total_external = c_atmosphere + c_resource + c_indirect
+    return {
+        "Atmosphere": c_atmosphere,
+        "Resource": c_resource,
+        "Indirect": c_indirect,
+        "TotalSocialExtra": total_external
+    }
+
 # =============================================================================
 # 3. 数据生成
 # =============================================================================
@@ -221,19 +263,26 @@ for T in t_axis:
     raw_fin_cost, m_roc, m_ele, avg_d, phy_res = solve_allocation_with_integral_cost(T, M_TOTAL)
     
     # 计算社会成本
-    env_cost_raw = calculate_social_total(phy_res, T)
+    bd = calculate_social_breakdown(phy_res, T)
+    env_cost_raw = bd["TotalSocialExtra"]
     
     # 压力惩罚
     pressure = (T_MAX - T) / (T_MAX - T_MIN)
     penalty = 1 + 0.5 * (pressure ** 2)
     
-    fin_final = raw_fin_cost * penalty
-    soc_final = (raw_fin_cost + env_cost_raw) * penalty
+    fin_raw = raw_fin_cost
+    soc_raw = raw_fin_cost + env_cost_raw
+    
+    fin_final = fin_raw * penalty
+    soc_final = soc_raw * penalty
     
     pareto_data.append({
         "Time": T, 
         "Financial": fin_final / 1e12,
         "Social": soc_final / 1e12,
+        "Atmosphere": (bd["Atmosphere"] * penalty) / 1e12,
+        "Resource": (bd["Resource"] * penalty) / 1e12,
+        "Indirect": (bd["Indirect"] * penalty) / 1e12,
         "Res": phy_res 
     })
 
@@ -356,6 +405,29 @@ years_iso, costs_iso = calculate_trajectory_with_scale_discount(
 )
 
 # =============================================================================
+# 3.5 导出绘图数据 (Excel)
+# =============================================================================
+df_keypoints = pd.DataFrame([
+    {"Method": "Baseline Financial (T=150)", "Time": t_base, "Financial": cost_base_fin, "Social": np.nan},
+    {"Method": "Method 1: Elevator Only", "Time": t_m1, "Financial": cost_m1_fin, "Social": cost_m1_soc},
+    {"Method": "Method 2: Rockets Only", "Time": t_m2, "Financial": cost_m2_fin, "Social": cost_m2_soc},
+    {"Method": "Iso-Slope Equivalent (Social)", "Time": t_iso, "Financial": np.nan, "Social": cost_iso_soc},
+])
+
+df_traj_base = pd.DataFrame({"Year": years_base, "AccumulatedCost_T": costs_base})
+df_traj_iso = pd.DataFrame({"Year": years_iso, "AccumulatedCost_T": costs_iso})
+
+export_path = "plot_data_export.xlsx"
+with pd.ExcelWriter(export_path, engine="openpyxl") as writer:
+    df_bases.to_excel(writer, sheet_name="Bases", index=False)
+    df_pareto.drop(columns=["Res"]).to_excel(writer, sheet_name="Pareto", index=False)
+    df_keypoints.to_excel(writer, sheet_name="KeyPoints", index=False)
+    df_traj_base.to_excel(writer, sheet_name="Trajectory_Baseline", index=False)
+    df_traj_iso.to_excel(writer, sheet_name="Trajectory_IsoSlope", index=False)
+
+print(f"--- 绘图数据已导出: {export_path} ---")
+
+# =============================================================================
 # 4. 绘图 1: 帕累托前沿 (Iso-Slope Analysis + M1/M2 Corrected)
 # =============================================================================
 plt.figure(figsize=(12, 7))
@@ -408,6 +480,37 @@ plt.legend(loc='upper right')
 
 plt.tight_layout()
 plt.savefig("pareto_iso_slope.png")
+plt.show()
+
+# =============================================================================
+# 4.5 绘图 1.5: 全生命周期成本构成演化图 (LCSC Composition Evolution)
+# =============================================================================
+plt.figure(figsize=(12, 7))
+
+T = df_pareto["Time"].values
+
+y_fin = df_pareto["Financial"].values
+y_atm = df_pareto["Atmosphere"].values
+y_res = df_pareto["Resource"].values
+y_ind = df_pareto["Indirect"].values
+
+plt.stackplot(
+    T,
+    y_fin, y_atm, y_res, y_ind,
+    labels=["Financial (Direct)", "Atmosphere Damage", "Resource Depletion", "Indirect Impacts"],
+    alpha=0.9
+)
+
+plt.plot(T, df_pareto["Social"].values, linewidth=2.0, linestyle="--", label="Total Social Cost (check)")
+
+plt.title("LCSC Composition Evolution (Stacked Area): Atmosphere / Resource / Indirect", fontsize=14)
+plt.xlabel("Completion Time (Years)", fontsize=12)
+plt.ylabel("Cost (Trillion USD)", fontsize=12)
+plt.grid(True, linestyle="--", alpha=0.4)
+plt.legend(loc="upper right")
+
+plt.tight_layout()
+plt.savefig("lcsc_composition_evolution.png")
 plt.show()
 
 # =============================================================================
